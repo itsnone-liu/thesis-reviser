@@ -766,6 +766,7 @@ def main():
         print(f"  [DOCX {prog}%] {msg}")
 
     design_txt_to_docx_safe(txt_path, docx_path, drawing_images, update_fn)
+    finalize_docx(docx_path, update_fn)
 
     final_docx = os.path.join(args.output, "论文_修改版.docx")
     shutil.copy(docx_path, final_docx)
@@ -778,3 +779,203 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def finalize_docx(docx_path, update):
+    """分节符修正 + PDF 真实页码 + 目录更新 + 页脚"""
+    update("正在处理分节符和页码...", 92)
+    doc = Document(docx_path)
+    paragraphs = doc.paragraphs
+    body = doc.element.body
+
+    toc_idx = -1
+    for i, p in enumerate(paragraphs):
+        if p.text.strip() == '目录':
+            toc_idx = i
+            break
+
+    chapter1_idx = -1
+    for i, p in enumerate(paragraphs):
+        t = p.text.strip()
+        if re.match(r'^第1章\s', t) and i > toc_idx + 3 and '\t' not in t:
+            chapter1_idx = i
+            break
+
+    if chapter1_idx < 0:
+        print("[跳过] 未找到第1章")
+        return
+
+    toc_end_idx = chapter1_idx - 1
+    while toc_end_idx > toc_idx:
+        if paragraphs[toc_end_idx].text.strip():
+            break
+        toc_end_idx -= 1
+
+    toc_headings = []
+    toc_range_start = toc_idx + 1 if toc_idx >= 0 else 0
+    for i in range(toc_range_start, chapter1_idx):
+        t = paragraphs[i].text.strip()
+        if t:
+            heading = t.split('\t')[0].strip() if '\t' in t else t
+            toc_headings.append(heading)
+
+    # 保存临时副本 → 转 PDF → 算页码
+    tag = uuid.uuid4().hex[:8]
+    temp_docx = docx_path.replace('.docx', f'_temp_{tag}.docx')
+    doc.save(temp_docx)
+
+    update("正在用 LibreOffice 渲染 PDF 计算页码...", 95)
+    pdf_path = os.path.join(os.path.dirname(temp_docx) or '.', f'_temp_{tag}.pdf')
+    subprocess.run(['libreoffice', '--headless', '--convert-to', 'pdf',
+                    temp_docx, '--outdir', os.path.dirname(pdf_path)],
+                   capture_output=True, text=True, timeout=120)
+    expected = temp_docx.replace('.docx', '.pdf')
+    if os.path.exists(expected):
+        os.rename(expected, pdf_path)
+
+    heading_abs_pages = {}
+    if os.path.exists(pdf_path):
+        result = subprocess.run(['pdfinfo', pdf_path], capture_output=True, text=True)
+        num_pages = 0
+        for line in result.stdout.split('\n'):
+            if line.startswith('Pages'):
+                num_pages = int(line.split(':')[1].strip())
+                break
+
+        # 找目录页并跳过
+        toc_pdf_page = -1
+        for pg in range(1, num_pages + 1):
+            r = subprocess.run(['pdftotext', '-f', str(pg), '-l', str(pg), pdf_path, '-'],
+                               capture_output=True, text=True)
+            lines = [l.strip() for l in r.stdout.split('\n') if l.strip()]
+            if any(l == '目录' for l in lines):
+                toc_pdf_page = pg
+                break
+
+        start_pg = toc_pdf_page + 1 if toc_pdf_page >= 0 else 1
+        for pg in range(start_pg, num_pages + 1):
+            r = subprocess.run(['pdftotext', '-f', str(pg), '-l', str(pg), pdf_path, '-'],
+                               capture_output=True, text=True)
+            text_flat = re.sub(r'\s+', '', r.stdout)
+            for h in toc_headings:
+                if h in heading_abs_pages:
+                    continue
+                h_flat = re.sub(r'\s+', '', h)
+                if h_flat in text_flat:
+                    heading_abs_pages[h] = pg
+
+        ch1_heading = next((h for h in toc_headings if h.startswith('第1章')), None)
+        ch1_page = heading_abs_pages.get(ch1_heading, 1)
+        offset = ch1_page - 1
+
+        # 更新目录页码
+        update("正在更新目录页码...", 97)
+        for i in range(toc_range_start, chapter1_idx):
+            p = paragraphs[i]
+            t = p.text.strip()
+            if not t:
+                continue
+            heading_text = t.split('\t')[0].strip() if '\t' in t else t
+            if heading_text in heading_abs_pages:
+                sec_page = heading_abs_pages[heading_text] - offset
+                if sec_page >= 1:
+                    p.clear()
+                    tab_stops = p.paragraph_format.tab_stops
+                    tab_stops.add_tab_stop(Cm(16), alignment=WD_TAB_ALIGNMENT.RIGHT,
+                                           leader=WD_TAB_LEADER.DOTS)
+                    r = p.add_run(heading_text)
+                    set_run_font(r, "宋体", 14)
+                    p.alignment = 0
+                    p.add_run("\t")
+                    rp = p.add_run(str(sec_page))
+                    set_run_font(rp, "宋体", 14)
+
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+
+    # 分节符
+    last_sect_pr = None
+    for child in list(body):
+        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+        if tag == 'sectPr':
+            last_sect_pr = child
+
+    if last_sect_pr is not None:
+        template = deepcopy(last_sect_pr)
+        body.remove(last_sect_pr)
+
+        toc_end_elem = paragraphs[toc_end_idx]._element
+        toc_end_pPr = toc_end_elem.find(qn('w:pPr'))
+        if toc_end_pPr is None:
+            toc_end_pPr = OxmlElement('w:pPr')
+            toc_end_elem.insert(0, toc_end_pPr)
+        sPr0 = OxmlElement('w:sectPr')
+        for c in template:
+            tag = c.tag.split('}')[-1] if '}' in c.tag else c.tag
+            if tag in ('pgSz', 'pgMar'):
+                sPr0.append(deepcopy(c))
+        toc_end_pPr.append(sPr0)
+
+        ts = OxmlElement('w:sectPr')
+        for c in template:
+            tag = c.tag.split('}')[-1] if '}' in c.tag else c.tag
+            if tag in ('pgSz', 'pgMar'):
+                ts.append(deepcopy(c))
+        pgnt = OxmlElement('w:pgNumType')
+        pgnt.set(qn('w:start'), '1')
+        ts.append(pgnt)
+        body.append(ts)
+
+    # 移除第1章的 pageBreakBefore
+    ch1_elem = paragraphs[chapter1_idx]._element
+    ch1_pPr = ch1_elem.find(qn('w:pPr'))
+    if ch1_pPr is not None:
+        for pb in ch1_pPr.findall(qn('w:pageBreakBefore')):
+            ch1_pPr.remove(pb)
+
+    # 页脚
+    try:
+        sec0 = doc.sections[0]
+        sec0.different_first_page_header_footer = True
+        for fn in ['footer', 'even_page_footer', 'first_page_footer']:
+            try:
+                f = getattr(sec0, fn)
+                f.is_linked_to_previous = False
+                for pf in f.paragraphs:
+                    pf.clear()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        if len(doc.sections) > 1:
+            sec1 = doc.sections[1]
+            footer = sec1.footer
+            footer.is_linked_to_previous = False
+            for pf in footer.paragraphs:
+                pf.clear()
+            pf = footer.paragraphs[0]
+            pf.alignment = 1
+            run = pf.add_run()
+            fc1 = OxmlElement('w:fldChar')
+            fc1.set(qn('w:fldCharType'), 'begin')
+            run._element.append(fc1)
+            it = OxmlElement('w:instrText')
+            it.set(qn('xml:space'), 'preserve')
+            it.text = ' PAGE '
+            run._element.append(it)
+            fc2 = OxmlElement('w:fldChar')
+            fc2.set(qn('w:fldCharType'), 'end')
+            run._element.append(fc2)
+    except Exception as e:
+        print(f"页脚处理异常: {e}")
+
+    doc.save(docx_path)
+    if os.path.exists(temp_docx):
+        os.remove(temp_docx)
+    update("最终排版完成", 100)
+
+
+
+    finalize_docx(docx_path, update_fn)
